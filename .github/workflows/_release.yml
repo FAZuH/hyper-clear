@@ -1,5 +1,3 @@
-# Credit: Workflow configs based on https://github.com/Wynntils/Wynntils
-
 name: Release
 
 on:
