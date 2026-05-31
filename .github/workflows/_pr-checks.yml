@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: ''
+      verify-publish:
+        description: 'Run cargo publish --dry-run to validate publishability'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run:
@@ -47,3 +52,7 @@ jobs:
 
       - name: Run Tests
         run: cargo test --all-features --no-fail-fast
+
+      - name: Verify Package (dry-run)
+        if: ${{ inputs.verify-publish }}
+        run: cargo publish --dry-run --allow-dirty
