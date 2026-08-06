@@ -42,6 +42,9 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci"
+          add-job-id-key: false
 
       - name: Download Patched Cargo.toml
         id: download-cargo
