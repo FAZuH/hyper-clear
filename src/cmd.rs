@@ -110,24 +110,39 @@ fn is_blur() -> Result<bool> {
 
     let s = String::from_utf8(output.stdout)?;
 
-    for line in s.lines() {
-        if let Some(val) = line.strip_prefix("int: ") {
-            return Ok(val == "1");
-        }
+    if let Some(enabled) = parse_blur_option(&s) {
+        return Ok(enabled);
     }
 
-    tracing::warn!("failed to get blur status. defaulting to enabled");
-
-    Ok(true)
+    bail!("failed to parse blur status from: {s:?}");
 }
 
+/// Hyprland's Lua config reports `bool: true`; older releases reported `int: 1`.
+fn parse_blur_option(s: &str) -> Option<bool> {
+    s.lines().find_map(|line| {
+        if let Some(val) = line.strip_prefix("bool: ") {
+            Some(val == "true")
+        } else {
+            line.strip_prefix("int: ").map(|val| val == "1")
+        }
+    })
+}
+
+fn blur_config_expr(enable_blur: bool) -> String {
+    format!("hl.config({{ decoration = {{ blur = {{ enabled = {enable_blur} }} }} }})")
+}
+
+/// `hyprctl keyword` is rejected by the Lua config parser, and the rejection
+/// still exits 0. `eval` is the runtime path for a config change.
 fn set_blur(enable_blur: bool) -> Result<()> {
-    let blur = if enable_blur { "1" } else { "0" };
-    let _ = Command::new("hyprctl")
-        .args(["keyword", "decoration:blur:enabled", blur])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let output = Command::new("hyprctl")
+        .args(["eval", blur_config_expr(enable_blur).as_str()])
+        .output()?;
+    check_hyprctl_output(&output)?;
+
+    if is_blur()? != enable_blur {
+        bail!("hyprctl accepted the blur change but the option did not follow");
+    }
 
     Ok(())
 }
@@ -138,9 +153,10 @@ fn get_active_window() -> Result<WindowAddr> {
         .output()?;
 
     let json: serde_json::Value = serde_json::from_slice(&windows.stdout)?;
-    let Some(addr) = json.get("address").map(|v| v.to_string()) else {
-        bail!("failed getting address of active window")
-    };
+    let addr = json
+        .get("address")
+        .map(|v| v.to_string())
+        .ok_or_else(|| color_eyre::eyre::eyre!("failed getting address of active window"))?;
 
     WindowAddr::from_str(&addr)
 }
@@ -154,9 +170,21 @@ fn get_opacity(addr: WindowAddr) -> Result<OpacityOverride> {
 }
 
 fn set_opacity(addr: WindowAddr, opacity: OpacityOverride) -> Result<()> {
-    set_prop(addr, Opacities::Active, opacity.active)?;
-    set_prop(addr, Opacities::Inactive, opacity.inactive)?;
-    set_prop(addr, Opacities::Fullscreen, opacity.fullscreen)?;
+    dispatch_set_prop(
+        addr,
+        Opacities::Active.as_str(),
+        &opacity.active.as_decimal(),
+    )?;
+    dispatch_set_prop(
+        addr,
+        Opacities::Inactive.as_str(),
+        &opacity.inactive.as_decimal(),
+    )?;
+    dispatch_set_prop(
+        addr,
+        Opacities::Fullscreen.as_str(),
+        &opacity.fullscreen.as_decimal(),
+    )?;
 
     Ok(())
 }
@@ -175,37 +203,39 @@ fn get_prop(addr: WindowAddr, opacities: Opacities) -> Result<Percent> {
     Ok(Percent::from_str(&s)?)
 }
 
-fn set_prop(addr: WindowAddr, opacities: Opacities, value: Percent) -> Result<()> {
-    let _ = Command::new("hyprctl")
-        .args([
-            "dispatch",
-            "setprop",
-            format!("address:{addr}").as_str(),
-            opacities.as_str(),
-            &value.as_decimal(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+fn set_prop_expr(addr: WindowAddr, prop: &str, value: &str) -> String {
+    format!(
+        "hl.dsp.window.set_prop({{ window = \"address:{addr}\", prop = \"{prop}\", value = \"{value}\" }})"
+    )
+}
+
+fn check_hyprctl_output(output: &std::process::Output) -> Result<()> {
+    if !output.status.success() {
+        bail!(
+            "hyprctl failed (exit {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    if s.contains("error:") {
+        bail!("hyprctl failed: {s}");
+    }
 
     Ok(())
 }
 
+fn dispatch_set_prop(addr: WindowAddr, prop: &str, value: &str) -> Result<()> {
+    let expr = set_prop_expr(addr, prop, value);
+    let output = Command::new("hyprctl")
+        .args(["dispatch", expr.as_str()])
+        .output()?;
+    check_hyprctl_output(&output)
+}
+
 fn set_opaque(addr: WindowAddr, value: bool) -> Result<()> {
     let value = if value { "on" } else { "off" };
-    let _ = Command::new("hyprctl")
-        .args([
-            "dispatch",
-            "setprop",
-            format!("address:{addr}").as_str(),
-            "opaque",
-            value,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    Ok(())
+    dispatch_set_prop(addr, "opaque", value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,11 +263,11 @@ impl std::fmt::Display for Opacities {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OpacityOverride {
-    /// opacity_override
+    /// opacity
     active: Percent,
-    /// opacity_inactive_override
+    /// opacity_inactive
     inactive: Percent,
-    /// opacity_fullscreen_override
+    /// opacity_fullscreen
     fullscreen: Percent,
 }
 
@@ -340,5 +370,85 @@ impl FromStr for WindowAddr {
 impl std::fmt::Display for WindowAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "0x{:x}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
+    use super::*;
+
+    #[test]
+    fn opacity_writes_target_override_props() {
+        let addr = WindowAddr(0x1);
+        assert_eq!(
+            set_prop_expr(addr, Opacities::Active.as_str(), "0.5"),
+            r#"hl.dsp.window.set_prop({ window = "address:0x1", prop = "opacity", value = "0.5" })"#
+        );
+        assert_eq!(
+            set_prop_expr(addr, Opacities::Inactive.as_str(), "0.8"),
+            r#"hl.dsp.window.set_prop({ window = "address:0x1", prop = "opacity_inactive", value = "0.8" })"#
+        );
+        assert_eq!(
+            set_prop_expr(addr, Opacities::Fullscreen.as_str(), "1"),
+            r#"hl.dsp.window.set_prop({ window = "address:0x1", prop = "opacity_fullscreen", value = "1" })"#
+        );
+    }
+
+    #[test]
+    fn opaque_write_passes_through_on_off_value() {
+        assert_eq!(
+            set_prop_expr(WindowAddr(0xab), "opaque", "off"),
+            r#"hl.dsp.window.set_prop({ window = "address:0xab", prop = "opaque", value = "off" })"#
+        );
+    }
+
+    #[test]
+    fn failed_dispatch_reports_hyprctl_message() {
+        let output = std::process::Output {
+            status: ExitStatusExt::from_raw(7 << 8),
+            stdout: b"error: hl.dispatch: expected a dispatcher".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        let err = check_hyprctl_output(&output).unwrap_err();
+
+        assert!(
+            err.to_string().contains("expected a dispatcher"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn successful_dispatch_is_accepted() {
+        let output = std::process::Output {
+            status: ExitStatusExt::from_raw(0),
+            stdout: b"ok".to_vec(),
+            stderr: Vec::new(),
+        };
+
+        check_hyprctl_output(&output).unwrap();
+    }
+
+    #[test]
+    fn blur_option_parses_current_and_legacy_shapes() {
+        assert_eq!(parse_blur_option("bool: true\nset: true\n"), Some(true));
+        assert_eq!(parse_blur_option("bool: false\nset: true\n"), Some(false));
+        assert_eq!(parse_blur_option("int: 1\nset: true\n"), Some(true));
+        assert_eq!(parse_blur_option("int: 0\nset: true\n"), Some(false));
+        assert_eq!(parse_blur_option("garbage\n"), None);
+    }
+
+    #[test]
+    fn blur_config_uses_lua_eval_expression() {
+        assert_eq!(
+            blur_config_expr(false),
+            "hl.config({ decoration = { blur = { enabled = false } } })"
+        );
+        assert_eq!(
+            blur_config_expr(true),
+            "hl.config({ decoration = { blur = { enabled = true } } })"
+        );
     }
 }
